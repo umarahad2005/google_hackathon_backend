@@ -1,0 +1,38 @@
+# Zimma AI — Backend Dependencies
+# Python 3.11+ required
+
+# --- Web Framework ---
+# [standard] bundles the `fastapi` CLI (fastapi-cli), which FastAPI Cloud
+# invokes to run the app (`fastapi run`). Plain `fastapi` omits the CLI and
+# fails with: RuntimeError: To use the fastapi command, install fastapi[standard].
+fastapi[standard]>=0.115.0
+uvicorn[standard]>=0.30.0
+sse-starlette>=2.0.0
+python-multipart>=0.0.9
+
+# --- AI / LLM ---
+google-adk>=1.0.0
+google-genai>=1.0.0
+
+# --- Data Validation ---
+pydantic>=2.7.0
+pydantic-settings>=2.3.0
+
+# --- Supabase ---
+supabase>=2.7.0
+postgrest>=0.16.0
+
+# --- Google Maps ---
+googlemaps>=4.10.0
+
+# --- HTTP Client ---
+httpx>=0.27.0
+
+# --- Utilities ---
+python-dotenv>=1.0.0
+python-dateutil>=2.9.0
+
+# --- Testing ---
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+httpx  # also used for test client
