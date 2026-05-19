@@ -72,7 +72,7 @@ app.add_middleware(
 # ======================================================================
 
 
-async def _run_pipeline(request_id: str, message: str, user_id: str, audio_url: str | None):
+async def _run_pipeline(request_id: str, message: str, user_id: str, audio_url: str | None, image_url: str | None = None):
     """Background task: run the ADK orchestrator pipeline."""
     try:
         from app.services.supabase import list_service_requests
@@ -85,6 +85,7 @@ async def _run_pipeline(request_id: str, message: str, user_id: str, audio_url: 
             raw_message=message,
             user_id=user_id,
             audio_url=audio_url,
+            image_url=image_url,
             auto_confirm=True,
             history=history,
         )
@@ -128,7 +129,7 @@ async def create_request(
 
     # Start pipeline in background
     background_tasks.add_task(
-        _run_pipeline, request_id, body.message, user_id, body.audio_url
+        _run_pipeline, request_id, body.message, user_id, body.audio_url, body.image_url
     )
 
     logger.info(f"Request created: {request_id} — pipeline started in background")

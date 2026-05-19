@@ -183,6 +183,7 @@ async def run_intent_agent(
     request_id: str,
     raw_message: str,
     audio_url: str | None = None,
+    image_url: str | None = None,
     history: list[dict] | None = None,
 ) -> ServiceIntent:
     """
@@ -193,7 +194,7 @@ async def run_intent_agent(
         request_id=request_id,
         agent="intent_nlu",
         step="intent.extract",
-        input_data={"raw_message": raw_message, "audio_url": audio_url},
+        input_data={"raw_message": raw_message, "audio_url": audio_url, "image_url": image_url},
         model=MODELS.flash,
     ) as trace:
         try:
@@ -216,10 +217,25 @@ async def run_intent_agent(
                 f"Message: \"{raw_message}\"\n\n"
                 f"Return ONLY valid JSON matching the output format."
             )
+            
+            contents = [user_prompt]
+            if image_url:
+                try:
+                    import httpx
+                    import mimetypes
+                    async with httpx.AsyncClient() as http_client:
+                        resp = await http_client.get(image_url)
+                        resp.raise_for_status()
+                        mime_type = mimetypes.guess_type(image_url)[0] or "image/jpeg"
+                        contents.append(
+                            types.Part.from_bytes(data=resp.content, mime_type=mime_type)
+                        )
+                except Exception as img_err:
+                    logger.warning(f"Failed to load image for intent extraction: {img_err}")
 
             response = client.models.generate_content(
                 model=MODELS.flash,
-                contents=user_prompt,
+                contents=contents,
                 config=types.GenerateContentConfig(
                     system_instruction=SYSTEM_PROMPT,
                     temperature=0.1,

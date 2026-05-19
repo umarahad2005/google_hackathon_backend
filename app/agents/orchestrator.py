@@ -60,6 +60,7 @@ async def run_orchestrator(
     raw_message: str,
     user_id: str = "demo-user",
     audio_url: str | None = None,
+    image_url: str | None = None,
     auto_confirm: bool = True,
     history: list[dict] | None = None,
 ) -> RequestContext:
@@ -76,6 +77,7 @@ async def run_orchestrator(
         request_id=request_id,
         raw_message=raw_message,
         audio_url=audio_url,
+        image_url=image_url,
         user_id=user_id,
         state=RequestState.NEW,
     )
@@ -109,7 +111,7 @@ async def run_orchestrator(
 
     await _transition(ctx, RequestState.UNDERSTANDING, "Routing to Intent/NLU Agent for extraction")
 
-    intent = await run_intent_agent(request_id, raw_message, audio_url, history=history)
+    intent = await run_intent_agent(request_id, raw_message, audio_url, image_url, history=history)
     ctx.intent = intent
     ctx.language = intent.language
 
