@@ -23,7 +23,7 @@ import asyncio
 import re
 
 from app.agents.config import MODELS, RANKING_WEIGHTS
-from app.agents.gemini import generate_content_resilient
+from app.agents.gemini import generate_content_resilient, get_genai_client
 from app.models import (
     ProviderCandidate,
     RankedProvider,
@@ -233,7 +233,7 @@ async def _generate_reasoning(
         )
 
     try:
-        client = genai.Client(api_key=get_settings().gemini_api_key)
+        client = get_genai_client()
         response, _model_used = generate_content_resilient(
             client,
             MODELS.pro_chain,

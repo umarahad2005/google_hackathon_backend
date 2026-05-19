@@ -22,6 +22,11 @@ htmlcov/
 .env.*
 !.env.example
 
+# GCP service-account keys — NEVER commit
+zimmaai-*.json
+*-service-account*.json
+service-account*.json
+
 # IDE
 .idea/
 .vscode/

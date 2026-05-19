@@ -13,7 +13,25 @@ class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
     # --- Gemini ---
-    gemini_api_key: str
+    # Plain AI Studio API key (generativelanguage.googleapis.com, free tier).
+    # Optional when running in Vertex mode (org policy may block plain keys).
+    gemini_api_key: str = ""
+
+    # --- Vertex AI mode ---
+    # When true, calls go through Vertex AI (aiplatform.googleapis.com),
+    # authenticated by a service account → billed to the GCP project
+    # (uses your credit, not the free-tier limit:0). Required if your org
+    # policy forbids plain-API-key access to Gemini.
+    gemini_use_vertex: bool = False
+    # Vertex AI Express Mode key (starts with "AQ."). If set (and
+    # gemini_use_vertex=True), used instead of service-account auth — no
+    # IAM role / API-enable / JSON needed.
+    vertex_express_api_key: str = ""
+    google_cloud_project: str = ""
+    google_cloud_location: str = "us-central1"
+    # Path to the service-account JSON. If empty, Application Default
+    # Credentials (GOOGLE_APPLICATION_CREDENTIALS / metadata) are used.
+    google_application_credentials: str = ""
 
     # --- Google Maps ---
     google_maps_api_key: str

@@ -22,7 +22,7 @@ from google import genai
 from google.genai import types
 
 from app.agents.config import MODELS
-from app.agents.gemini import generate_content_resilient
+from app.agents.gemini import generate_content_resilient, get_genai_client
 from app.models import ServiceIntent, Language, Urgency
 from app.agents.trace_observer import TraceContext
 from app.settings import get_settings
@@ -200,7 +200,7 @@ async def run_intent_agent(
     ) as trace:
         try:
             # Call Gemini for intent extraction
-            client = genai.Client(api_key=get_settings().gemini_api_key)
+            client = get_genai_client()
 
             # Build the user prompt
             history_text = ""
