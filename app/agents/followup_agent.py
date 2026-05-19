@@ -69,9 +69,10 @@ def _generate_status_message(status: str, provider_name: str) -> str:
 
 
 # Keep events visibly sequential even at huge multipliers, and never let
-# the compressed gap stall a live demo.
-_MIN_GAP_S = 1.5
-_MAX_GAP_S = 25.0
+# the compressed gap stall a live demo. For the Hackathon Demo Video,
+# we set the minimum gap to 5 seconds so the presenter can explain each step.
+_MIN_GAP_S = 5.0
+_MAX_GAP_S = 10.0
 
 
 async def _run_followup_scheduler(

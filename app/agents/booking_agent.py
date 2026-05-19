@@ -29,6 +29,12 @@ logger = logging.getLogger(__name__)
 
 PKT = timezone(timedelta(hours=5))
 
+# A provider_id that is a real UUID came from the Supabase DB; non-UUID ids
+# (e.g. Google Places ids) are external and have no availability rows.
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I
+)
+
 
 def _generate_confirmation_message(
     provider_name: str,

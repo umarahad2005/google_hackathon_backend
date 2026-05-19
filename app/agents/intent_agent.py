@@ -22,6 +22,7 @@ from google import genai
 from google.genai import types
 
 from app.agents.config import MODELS
+from app.agents.gemini import generate_content_resilient
 from app.models import ServiceIntent, Language, Urgency
 from app.agents.trace_observer import TraceContext
 from app.settings import get_settings
@@ -233,8 +234,9 @@ async def run_intent_agent(
                 except Exception as img_err:
                     logger.warning(f"Failed to load image for intent extraction: {img_err}")
 
-            response = client.models.generate_content(
-                model=MODELS.flash,
+            response, model_used = generate_content_resilient(
+                client,
+                MODELS.flash_chain,
                 contents=contents,
                 config=types.GenerateContentConfig(
                     system_instruction=SYSTEM_PROMPT,
@@ -283,11 +285,12 @@ async def run_intent_agent(
             )
 
             # Set trace output
+            trace.model = model_used
             trace.reasoning = intent.reasoning
             trace.output_data = intent.model_dump(mode="json")
             trace.add_tool_call(
                 name="gemini_intent_extract",
-                args={"message": raw_message},
+                args={"message": raw_message, "model": model_used},
                 result_summary=f"service={intent.service_type}, location={intent.location_text}, "
                                f"time={intent.time_text}→"
                                f"{time_start.isoformat() if time_start else 'none'} "

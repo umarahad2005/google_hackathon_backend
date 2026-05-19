@@ -36,6 +36,17 @@ class Settings(BaseSettings):
     gemini_flash_model: str = "gemini-2.0-flash"
     gemini_pro_model: str = "gemini-2.5-flash"
 
+    # Ordered fallback chains (comma-separated). The primary model above is
+    # tried first; if it is quota-exhausted / rate-limited, the next model
+    # in the chain is tried automatically. Override via env if needed.
+    gemini_flash_fallbacks: str = (
+        "gemini-2.5-flash,gemini-2.0-flash-lite,"
+        "gemini-2.5-flash-lite,gemini-1.5-flash"
+    )
+    gemini_pro_fallbacks: str = (
+        "gemini-2.0-flash,gemini-2.5-flash-lite,gemini-1.5-flash"
+    )
+
     model_config = {
         "env_file": ".env",
         "env_file_encoding": "utf-8",
