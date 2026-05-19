@@ -87,6 +87,20 @@ SECTOR_GAZETTEER: dict[str, tuple[float, float]] = {
     "pwd":        (33.5600, 73.0800),
 }
 
+# Known Pakistani cities. If the user's location text already names one of
+# these, we must NOT force an "Islamabad" context onto the geocoder — doing
+# so is what made "Mansoorah Home Lahore" resolve to Blue Area, Islamabad.
+PK_CITIES: tuple[str, ...] = (
+    "lahore", "karachi", "islamabad", "rawalpindi", "faisalabad",
+    "multan", "peshawar", "quetta", "sialkot", "gujranwala", "hyderabad",
+    "bahawalpur", "sargodha", "abbottabad", "sukkur", "larkana", "mardan",
+    "sahiwal", "okara", "wah", "dera ghazi khan", "mirpur", "muzaffarabad",
+)
+
+# Default city context for bare sector text (e.g. "G-13") — the gazetteer
+# and primary service area are Islamabad/Rawalpindi.
+DEFAULT_CITY_CONTEXT = "Islamabad, Pakistan"
+
 # Category mapping for Places API search terms
 CATEGORY_SEARCH_TERMS: dict[str, str] = {
     "ac_technician": "AC repair technician air conditioning",
@@ -124,19 +138,38 @@ def resolve_location(location_text: str) -> tuple[tuple[float, float], str] | No
 
     source ∈ {"geocoding", "gazetteer"}.
     """
-    normalized = (
-        location_text.strip().lower().replace(",", "")
-        .replace("islamabad", "").strip()
-    )
+    raw = location_text.strip()
+    lowered = raw.lower()
+
+    # Detect whether the user already named a city. If so, geocode the text
+    # as-is (just country-scoped); only bare sector text falls back to the
+    # Islamabad default context.
+    mentioned_city = next((c for c in PK_CITIES if c in lowered), None)
+    if mentioned_city:
+        query = f"{raw}, Pakistan"
+    else:
+        query = f"{raw}, {DEFAULT_CITY_CONTEXT}"
+
+    # For the offline gazetteer match we only strip the *default* city, not
+    # an explicitly-requested one (a Lahore query must never match an
+    # Islamabad sector key).
+    normalized = lowered.replace(",", "")
+    if not mentioned_city:
+        normalized = normalized.replace("islamabad", "")
+    normalized = normalized.strip()
 
     # 1. Real Geocoding API (authoritative)
     client = _get_maps_client()
     if client:
         try:
-            cache_key = f"geocode:{normalized}"
+            cache_key = f"geocode:{query.lower()}"
             if cache_key in _cache:
                 return _cache[cache_key], "geocoding"
-            results = client.geocode(f"{location_text}, Islamabad, Pakistan")
+            # region="PK" + country component keep results inside Pakistan
+            # while still honouring the city the user actually asked for.
+            results = client.geocode(
+                query, region="pk", components={"country": "PK"}
+            )
             if results:
                 loc = results[0]["geometry"]["location"]
                 coords = (loc["lat"], loc["lng"])
@@ -149,8 +182,11 @@ def resolve_location(location_text: str) -> tuple[tuple[float, float], str] | No
         except Exception as e:
             logger.warning(f"Geocoding API failed for '{location_text}': {e}")
 
-    # 2. Offline gazetteer fallback (degraded)
-    for key, coords in SECTOR_GAZETTEER.items():
+    # 2. Offline gazetteer fallback (degraded). The gazetteer is
+    # Islamabad/Rawalpindi-only, so skip it entirely when the user asked
+    # for another city — a wrong-city sector is worse than honest failure.
+    gazetteer_ok = mentioned_city in (None, "islamabad", "rawalpindi")
+    for key, coords in (SECTOR_GAZETTEER.items() if gazetteer_ok else ()):
         if key in normalized or normalized in key:
             logger.info(
                 f"Location '{location_text}' resolved via gazetteer fallback: "

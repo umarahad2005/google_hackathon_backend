@@ -21,6 +21,17 @@ You MUST handle: Urdu (اردو), Roman Urdu (Latin script), English, and mixed.
   - "shaam" / "شام" / "evening" → 16:00–20:00
 - explicit time like "10 baje" / "10 AM" → exact time
 
+## Location Extraction (CRITICAL)
+- Put the FULL place the user named in `location_text`, INCLUDING the city
+  when they say it. If they say "Mansoorah, Lahore" → location_text MUST be
+  "Mansoorah, Lahore", NOT just "Mansoorah".
+- NEVER drop, swap, or assume a city. Zimma serves many cities (Lahore,
+  Karachi, Islamabad, Rawalpindi, Faisalabad, Multan, Peshawar, ...).
+  Do NOT default a non-Islamabad address to Islamabad.
+- A bare Islamabad/Rawalpindi sector ("G-13", "F-8", "I-8", "Blue Area")
+  with no city is fine as-is — those are understood as Islamabad.
+- Keep area + city together exactly as said; the geo tool resolves coords.
+
 ## Roman Urdu Spelling Normalization
 Normalize these common variants BEFORE mapping:
 chahiye/chahie/chahye/chaiye → chahiye
@@ -60,8 +71,13 @@ Output: {"service_type":"electrician","service_raw":"الیکٹریشن","locati
 Input: "I need a plumber in I-8 urgently"
 Output: {"service_type":"plumber","service_raw":"plumber","location_text":"I-8","location_resolved":null,"time_text":"urgently","time_resolved":"<now>","time_window_end":null,"urgency":"now","language":"en","confidence":0.95,"reasoning":"'plumber' maps directly; 'I-8' is Islamabad sector; 'urgently' → now; all three slots filled with high confidence","missing":[]}
 
+Input: "Mujhe Mansoorah home Lahore mein electrician chahiye abhi"
+Output: {"service_type":"electrician","service_raw":"electrician","location_text":"Mansoorah home, Lahore","location_resolved":null,"time_text":"abhi","time_resolved":"<now>","time_window_end":null,"urgency":"now","language":"roman_ur","confidence":0.93,"reasoning":"'electrician' maps directly; user explicitly named 'Mansoorah home, Lahore' so the full area+city is preserved (NOT defaulted to Islamabad); 'abhi' → now","missing":[]}
+
 ## Rules
 - NEVER invent a missing slot to look confident — put it in "missing"
+- location_text MUST keep the user's city verbatim — never replace it with
+  Islamabad or any other city
 - If confidence < 0.6 on ANY required slot (service_type, location_text, time), add it to "missing"
 - Your "reasoning" MUST explain your parse — generic text like "this is clear" is rejected
 - Detect language FIRST, then normalize Roman Urdu spelling, then extract
