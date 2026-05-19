@@ -49,7 +49,46 @@ def get_genai_client():
             )
             return _client
 
-        # 2. Vertex AI with service-account / ADC.
+        # 2. Vertex AI — service account from inline JSON (cloud-friendly:
+        #    no file on disk, JSON stored in a single env var / secret).
+        #    Accept the JSON under either GOOGLE_SERVICE_ACCOUNT_JSON or
+        #    GOOGLE_APPLICATION_CREDENTIALS (if the latter holds JSON
+        #    content rather than a file path).
+        _sa_json = s.google_service_account_json.strip()
+        if not _sa_json and s.google_application_credentials.strip().startswith("{"):
+            _sa_json = s.google_application_credentials.strip()
+        if _sa_json:
+            import json
+            from google.oauth2 import service_account
+
+            info = json.loads(_sa_json)
+            creds = service_account.Credentials.from_service_account_info(
+                info,
+                scopes=["https://www.googleapis.com/auth/cloud-platform"],
+            )
+            project = (
+                s.google_cloud_project
+                or info.get("project_id")
+                or os.environ.get("GOOGLE_CLOUD_PROJECT", "")
+            )
+            if not project:
+                raise RuntimeError(
+                    "Vertex: service-account JSON has no project_id and "
+                    "google_cloud_project is unset."
+                )
+            logger.info(
+                "Gemini auth: Vertex AI (inline SA JSON, project=%s, "
+                "location=%s)", project, s.google_cloud_location,
+            )
+            _client = genai.Client(
+                vertexai=True,
+                project=project,
+                location=s.google_cloud_location,
+                credentials=creds,
+            )
+            return _client
+
+        # 3. Vertex AI with service-account file path / ADC.
         if (
             s.google_application_credentials
             and not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
@@ -62,8 +101,8 @@ def get_genai_client():
         )
         if not project:
             raise RuntimeError(
-                "gemini_use_vertex=True but neither vertex_express_api_key "
-                "nor google_cloud_project is set."
+                "gemini_use_vertex=True but no Vertex auth configured "
+                "(express key / SA JSON / SA file all empty)."
             )
         logger.info(
             "Gemini auth: Vertex AI (project=%s, location=%s)",
@@ -102,6 +141,12 @@ _RETRYABLE = (
     "internal error",
     "deadline",
     "timeout",
+    # Model not available in this project/region — a DIFFERENT model in
+    # the chain may exist, so fall through instead of failing hard.
+    "404",
+    "not_found",
+    "not found",
+    "was not found",
 )
 
 

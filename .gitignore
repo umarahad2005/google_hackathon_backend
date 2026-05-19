@@ -26,6 +26,7 @@ htmlcov/
 zimmaai-*.json
 *-service-account*.json
 service-account*.json
+sa_oneline.txt
 
 # IDE
 .idea/
