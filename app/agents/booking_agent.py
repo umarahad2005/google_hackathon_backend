@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 from app.models import Booking, RankedProvider, ServiceIntent
 from app.services.supabase import (
     create_booking,
+    ensure_db_provider,
     get_availability,
     book_slot,
 )
@@ -150,8 +151,17 @@ async def run_booking_agent(
         suffix = "/month" if intent.service_type == "tutor" else ""
         price_estimate = f"PKR {lo:,} – {hi:,}{suffix}"
 
-        # Step 1: REAL slot reservation against provider_availability.
+        # Whether the provider already exists in the DB (UUID id) decides if
+        # it has provider_availability rows to reserve. This must be read
+        # from the ORIGINAL id, before any materialization below.
         is_db_provider = _UUID_RE.match(provider.provider_id or "") is not None
+
+        # bookings.provider_id is a uuid FK → public.providers(id). A Places
+        # provider's id is a place_id, not a uuid, so persist it as a real
+        # providers row first and use that uuid everywhere we write it.
+        db_provider_id = await ensure_db_provider(provider)
+
+        # Step 1: REAL slot reservation against provider_availability.
         chosen_slot_id: int | None = None
         slot_start = want_start
         slot_end = want_start + timedelta(hours=1)
@@ -211,10 +221,10 @@ async def run_booking_agent(
                 f"orchestrator can pick an alternative."
             )
             trace.output_data = {"status": "conflict",
-                                 "provider_id": provider.provider_id}
+                                 "provider_id": db_provider_id}
             return Booking(
                 booking_id=booking_id,
-                provider_id=provider.provider_id,
+                provider_id=db_provider_id,
                 user_id=user_id,
                 slot_start=slot_start,
                 slot_end=slot_end,
@@ -235,7 +245,7 @@ async def run_booking_agent(
         booking_data = {
             "id": booking_id,
             "request_id": request_id,
-            "provider_id": provider.provider_id,
+            "provider_id": db_provider_id,
             "user_id": user_id,
             "slot_start": slot_start.isoformat(),
             "slot_end": slot_end.isoformat(),
@@ -291,7 +301,7 @@ async def run_booking_agent(
         # Build booking result
         booking = Booking(
             booking_id=booking_id,
-            provider_id=provider.provider_id,
+            provider_id=db_provider_id,
             user_id=user_id,
             slot_start=slot_start,
             slot_end=slot_end,

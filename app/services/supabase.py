@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
@@ -190,6 +191,58 @@ async def find_providers_within(
         },
     ).execute()
     return result.data if result.data else []
+
+
+async def ensure_db_provider(provider: Any) -> str:
+    """
+    Return a valid public.providers.id (uuid) for `provider`.
+
+    Supabase/DB providers already carry a uuid id. Google Places providers
+    carry a place_id (e.g. "ChIJ…"), which is NOT a uuid — inserting it into
+    bookings.provider_id (uuid FK → providers.id) fails with 22P02 and aborts
+    the pipeline. So we materialize the Places provider into public.providers
+    (a real, non-synthetic row) and return its generated uuid, keeping the FK
+    intact and making the provider reusable.
+
+    Duck-typed on purpose (avoids importing app.models here): `provider` only
+    needs .provider_id/.name/.category/.rating/.price_band/.languages/.phone
+    and .lat/.lng.
+    """
+    pid = getattr(provider, "provider_id", None) or ""
+    if _UUID_RE.match(pid):
+        return pid  # already a DB provider
+
+    band = getattr(provider, "price_band", None)
+    row = {
+        "id": str(uuid.uuid4()),
+        "name": getattr(provider, "name", "Unknown provider"),
+        "category": getattr(provider, "category", "general"),
+        "rating": getattr(provider, "rating", None),
+        "price_band": band.value if band is not None else None,
+        "languages": getattr(provider, "languages", None) or [],
+        "phone": getattr(provider, "phone", None),
+        # Real external (Places) provider, not seeded demo data.
+        "is_synthetic": False,
+    }
+    lat = getattr(provider, "lat", None)
+    lng = getattr(provider, "lng", None)
+    if lat is not None and lng is not None:
+        # PostGIS geography accepts EWKT text on insert.
+        row["geo"] = f"SRID=4326;POINT({lng} {lat})"
+
+    sb = get_supabase()
+    try:
+        sb.table("providers").insert(row).execute()
+    except Exception as e:
+        # geo cast is the only fragile field — never let it break booking.
+        logger.warning(f"Provider insert with geo failed ({e}); retrying without geo")
+        row.pop("geo", None)
+        sb.table("providers").insert(row).execute()
+
+    logger.info(
+        f"Materialized Places provider '{row['name']}' → {row['id']}"
+    )
+    return row["id"]
 
 
 async def find_providers_by_category(
