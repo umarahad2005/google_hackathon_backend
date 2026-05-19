@@ -75,12 +75,18 @@ app.add_middleware(
 async def _run_pipeline(request_id: str, message: str, user_id: str, audio_url: str | None):
     """Background task: run the ADK orchestrator pipeline."""
     try:
+        from app.services.supabase import list_service_requests
+        history = await list_service_requests(user_id, limit=5)
+        # Exclude the current request from history
+        history = [h for h in history if h.get("id") != request_id]
+
         await run_orchestrator(
             request_id=request_id,
             raw_message=message,
             user_id=user_id,
             audio_url=audio_url,
             auto_confirm=True,
+            history=history,
         )
     except Exception as e:
         logger.error(f"Pipeline failed for {request_id}: {e}")
