@@ -183,6 +183,7 @@ async def run_intent_agent(
     request_id: str,
     raw_message: str,
     audio_url: str | None = None,
+    history: list[dict] | None = None,
 ) -> ServiceIntent:
     """
     Run the Intent/NLU Agent on a raw message.
@@ -200,9 +201,18 @@ async def run_intent_agent(
             client = genai.Client(api_key=get_settings().gemini_api_key)
 
             # Build the user prompt
+            history_text = ""
+            if history:
+                history_text = "Previous User Requests:\n"
+                for h in reversed(history[:3]): # Last 3 requests
+                    intent_data = h.get("intent") or {}
+                    history_text += f"- Request: \"{h.get('raw_message')}\" -> Extracted Service: {intent_data.get('service_type')}\n"
+                history_text += "\n"
+
             user_prompt = (
                 f"Extract the service intent from this message. "
                 f"Current time: {datetime.now(PKT).isoformat()}\n\n"
+                f"{history_text}"
                 f"Message: \"{raw_message}\"\n\n"
                 f"Return ONLY valid JSON matching the output format."
             )

@@ -61,6 +61,7 @@ async def run_orchestrator(
     user_id: str = "demo-user",
     audio_url: str | None = None,
     auto_confirm: bool = True,
+    history: list[dict] | None = None,
 ) -> RequestContext:
     """
     Run the full agentic pipeline for a service request.
@@ -108,7 +109,7 @@ async def run_orchestrator(
 
     await _transition(ctx, RequestState.UNDERSTANDING, "Routing to Intent/NLU Agent for extraction")
 
-    intent = await run_intent_agent(request_id, raw_message, audio_url)
+    intent = await run_intent_agent(request_id, raw_message, audio_url, history=history)
     ctx.intent = intent
     ctx.language = intent.language
 
