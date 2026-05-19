@@ -88,7 +88,9 @@ async def _run_followup_scheduler(
     becomes real elapsed-time logic (not a flat sleep) while still fitting
     a short demo. The wall clock is monotonic; nothing is hardcoded.
     """
-    multiplier = max(1, get_settings().demo_clock_multiplier)
+    settings = get_settings()
+    multiplier = max(1, settings.demo_clock_multiplier)
+    demo_gap = settings.followup_demo_gap_s
     ordered = sorted(followups, key=lambda f: f.fire_at)
     if not ordered:
         return
@@ -98,13 +100,20 @@ async def _run_followup_scheduler(
     start_real = loop.time()
 
     for i, fu in enumerate(ordered):
-        # Real seconds from the anchor = simulated gap / clock multiplier,
-        # clamped so events stay visibly sequential and never stall.
-        sim_offset = (fu.fire_at - anchor).total_seconds()
-        target = start_real + min(
-            max(sim_offset / multiplier, i * _MIN_GAP_S),
-            i * _MAX_GAP_S,
-        )
+        if demo_gap > 0:
+            # Demo-video mode: fixed, evenly-spaced cadence so the full
+            # lifecycle (reminder → en-route → in-progress → completed →
+            # rating) fits one continuous take. Step i fires at
+            # (i+1)*demo_gap real seconds from start.
+            target = start_real + (i + 1) * demo_gap
+        else:
+            # Real timeline: seconds from anchor = simulated gap / clock
+            # multiplier, clamped so events stay visibly sequential.
+            sim_offset = (fu.fire_at - anchor).total_seconds()
+            target = start_real + min(
+                max(sim_offset / multiplier, i * _MIN_GAP_S),
+                i * _MAX_GAP_S,
+            )
         delay = target - loop.time()
         if delay > 0:
             await asyncio.sleep(delay)
