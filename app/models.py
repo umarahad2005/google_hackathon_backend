@@ -264,6 +264,7 @@ class RequestContext(BaseModel):
     request_id: str
     raw_message: str
     audio_url: str | None = None
+    image_url: str | None = None
     language: Language | None = None
     intent: ServiceIntent | None = None
     candidates: list[ProviderCandidate] = Field(default_factory=list)
@@ -286,6 +287,7 @@ class CreateServiceRequest(BaseModel):
         ..., min_length=1, description="Natural-language service request"
     )
     audio_url: str | None = None
+    image_url: str | None = None
     user_id: str = "demo-user"
 
 
