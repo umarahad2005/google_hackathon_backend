@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, BackgroundTasks, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,9 +29,14 @@ from app.models import (
 from app.services.supabase import (
     create_service_request,
     get_service_request,
+    list_service_requests,
+    get_user_profile,
+    upsert_user_profile,
+    update_service_request,
     get_traces,
     get_booking,
     get_follow_ups,
+    resolve_user_id,
 )
 from app.agents.orchestrator import run_orchestrator
 from app.settings import get_settings
@@ -175,6 +181,75 @@ async def get_request(
 
 
 # ======================================================================
+# GET /api/requests — list the caller's past requests (History)
+# ======================================================================
+
+
+@app.get("/api/requests")
+async def list_requests(
+    current_user: str | None = Depends(get_current_user_id),
+    limit: int = 50,
+):
+    """History feed: the authenticated user's past service requests."""
+    rows = await list_service_requests(
+        current_user or "demo-user", limit=limit
+    )
+    items = []
+    for r in rows:
+        result = r.get("result") if isinstance(r.get("result"), dict) else {}
+        rec = (result or {}).get("recommended") or {}
+        intent = r.get("intent") if isinstance(r.get("intent"), dict) else {}
+        items.append({
+            "request_id": r.get("id"),
+            "state": r.get("state", "UNKNOWN"),
+            "raw_message": r.get("raw_message"),
+            "service_type": (intent or {}).get("service_type"),
+            "location": (intent or {}).get("location_text"),
+            "provider_name": rec.get("name"),
+            "created_at": r.get("created_at"),
+        })
+    return {"items": items, "count": len(items)}
+
+
+# ======================================================================
+# GET / PATCH /api/profile — user profile (Settings)
+# ======================================================================
+
+
+@app.get("/api/profile")
+async def get_profile(
+    current_user: str | None = Depends(get_current_user_id),
+):
+    """Return the caller's profile (creates a default row if missing)."""
+    uid = current_user or "demo-user"
+    prof = await get_user_profile(uid)
+    if not prof:
+        prof = await upsert_user_profile(
+            uid, {"display_name": "User", "lang_pref": "en"}
+        )
+    return prof
+
+
+@app.patch("/api/profile")
+async def patch_profile(
+    body: dict,
+    current_user: str | None = Depends(get_current_user_id),
+):
+    """Update display_name and/or lang_pref."""
+    allowed = {
+        k: v for k, v in (body or {}).items()
+        if k in ("display_name", "lang_pref") and v is not None
+    }
+    if not allowed:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "No updatable fields (display_name, lang_pref)"},
+        )
+    updated = await upsert_user_profile(current_user or "demo-user", allowed)
+    return updated
+
+
+# ======================================================================
 # GET /api/requests/{id}/trace — SSE trace stream
 # ======================================================================
 
@@ -243,16 +318,61 @@ async def trace_stream(
 
 
 @app.post("/api/requests/{request_id}/confirm")
-async def confirm_request(request_id: str, body: dict = None):
-    """Confirm the recommended provider (or specify alternative)."""
+async def confirm_request(
+    request_id: str,
+    body: dict | None = None,
+    current_user: str | None = Depends(get_current_user_id),
+):
+    """
+    Confirm the recommendation (or pick an alternative).
+
+    The agentic pipeline auto-confirms + reserves a real slot, so by the
+    time the user taps "confirm" the booking already exists. This endpoint
+    returns the real recommended provider + booking + alternatives and
+    records an explicit user confirmation/selection on the request.
+    """
     sr = await get_service_request(request_id)
     if not sr:
         return JSONResponse(
             status_code=404,
             content={"error": "Request not found", "request_id": request_id},
         )
+    if current_user is not None and sr.get("user_id") != current_user:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "Request not found", "request_id": request_id},
+        )
 
-    return {"request_id": request_id, "state": sr.get("state")}
+    body = body or {}
+    action = body.get("action", "accept")
+    chosen_provider_id = body.get("provider_id")
+
+    result = sr.get("result") or {}
+    recommended = result.get("recommended")
+    booking = result.get("booking")
+
+    confirmation = {
+        "action": action,
+        "selected_provider_id": chosen_provider_id
+        or (recommended or {}).get("provider_id"),
+        "confirmed_at": datetime.now(timezone.utc).isoformat(),
+        "by": current_user or "demo",
+    }
+    try:
+        await update_service_request(request_id, {
+            "result": {**result, "user_confirmation": confirmation},
+        })
+    except Exception as e:
+        logger.warning(f"Failed to persist user confirmation: {e}")
+
+    return {
+        "request_id": request_id,
+        "state": sr.get("state"),
+        "recommended": recommended,
+        "booking": booking,
+        "alternatives": result.get("alternatives", []),
+        "user_confirmation": confirmation,
+    }
 
 
 # ======================================================================

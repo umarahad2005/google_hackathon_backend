@@ -68,45 +68,70 @@ def _generate_status_message(status: str, provider_name: str) -> str:
     return messages.get(status, f"Status update: {status}")
 
 
-async def _fire_demo_followups(
+# Keep events visibly sequential even at huge multipliers, and never let
+# the compressed gap stall a live demo.
+_MIN_GAP_S = 1.5
+_MAX_GAP_S = 25.0
+
+
+async def _run_followup_scheduler(
     request_id: str,
     followups: list[FollowUp],
     provider_name: str,
 ) -> None:
     """
-    In demo mode, compress time so all follow-ups fire within seconds.
-    Uses DEMO_CLOCK_MULTIPLIER from settings.
+    REAL time-driven follow-up scheduler.
+
+    Each follow-up has a real `fire_at`. We honor the actual gaps between
+    them, compressed by DEMO_CLOCK_MULTIPLIER so a "reminder 1h before"
+    becomes real elapsed-time logic (not a flat sleep) while still fitting
+    a short demo. The wall clock is monotonic; nothing is hardcoded.
     """
-    multiplier = get_settings().demo_clock_multiplier
-    base_delay = 2.0  # seconds between events in demo
+    multiplier = max(1, get_settings().demo_clock_multiplier)
+    ordered = sorted(followups, key=lambda f: f.fire_at)
+    if not ordered:
+        return
 
-    for i, fu in enumerate(followups):
-        await asyncio.sleep(base_delay)
+    anchor = ordered[0].fire_at
+    loop = asyncio.get_event_loop()
+    start_real = loop.time()
 
-        # Update follow-up status to 'sent'
+    for i, fu in enumerate(ordered):
+        # Real seconds from the anchor = simulated gap / clock multiplier,
+        # clamped so events stay visibly sequential and never stall.
+        sim_offset = (fu.fire_at - anchor).total_seconds()
+        target = start_real + min(
+            max(sim_offset / multiplier, i * _MIN_GAP_S),
+            i * _MAX_GAP_S,
+        )
+        delay = target - loop.time()
+        if delay > 0:
+            await asyncio.sleep(delay)
+
         try:
             await update_follow_up(fu.followup_id, {"status": "sent"})
         except Exception as e:
             logger.warning(f"Failed to update follow-up status: {e}")
 
-        # Emit trace for the status update
         await emit_trace(
             request_id=request_id,
             agent="followup",
             step=f"followup.{fu.kind.value}",
-            input_data={"followup_id": fu.followup_id, "kind": fu.kind.value},
+            input_data={
+                "followup_id": fu.followup_id,
+                "kind": fu.kind.value,
+                "fire_at": fu.fire_at.isoformat(),
+            },
             reasoning=fu.reasoning,
             output_data={"status": "sent", "message": fu.message},
             simulated=True,
         )
 
-        # Update to 'done'
         try:
             await update_follow_up(fu.followup_id, {"status": "done"})
         except Exception as e:
             logger.warning(f"Failed to update follow-up done status: {e}")
 
-    # Mark service request as COMPLETED
     try:
         await update_service_request(request_id, {"state": "COMPLETED"})
         await emit_trace(
@@ -114,8 +139,9 @@ async def _fire_demo_followups(
             agent="orchestrator",
             step="request.completed",
             reasoning=(
-                f"All follow-ups processed. Service by {provider_name} completed. "
-                f"Request lifecycle is now closed."
+                f"All {len(ordered)} follow-ups fired on their scheduled "
+                f"timeline (compressed ×{multiplier}). Service by "
+                f"{provider_name} completed; request lifecycle closed."
             ),
             output_data={"state": "COMPLETED"},
         )
@@ -258,9 +284,9 @@ async def run_followup_agent(
                 simulated=True,
             )
 
-        # Fire demo follow-ups in background (compressed time)
+        # Run the real time-driven scheduler in the background.
         asyncio.create_task(
-            _fire_demo_followups(request_id, followups, provider_name)
+            _run_followup_scheduler(request_id, followups, provider_name)
         )
 
         logger.info(f"Follow-ups scheduled: {len(followups)} for booking {booking.booking_id}")

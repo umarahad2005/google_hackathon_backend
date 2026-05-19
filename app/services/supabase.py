@@ -122,6 +122,45 @@ async def get_service_request(request_id: str) -> dict | None:
     return result.data[0] if result.data else None
 
 
+async def list_service_requests(user_id: str, limit: int = 50) -> list[dict]:
+    """List a user's past service requests, newest first (for History)."""
+    sb = get_supabase()
+    result = (
+        sb.table("service_requests")
+        .select("id, state, raw_message, intent, result, created_at")
+        .eq("user_id", resolve_user_id(user_id))
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return result.data if result.data else []
+
+
+# ======================================================================
+# User profile
+# ======================================================================
+
+
+async def get_user_profile(user_id: str) -> dict | None:
+    """GET the public.users profile row for a user."""
+    sb = get_supabase()
+    result = (
+        sb.table("users")
+        .select("*")
+        .eq("id", resolve_user_id(user_id))
+        .execute()
+    )
+    return result.data[0] if result.data else None
+
+
+async def upsert_user_profile(user_id: str, fields: dict) -> dict:
+    """Create/update a user's profile (display_name, lang_pref)."""
+    sb = get_supabase()
+    row = {"id": resolve_user_id(user_id), **fields}
+    result = sb.table("users").upsert(row).execute()
+    return result.data[0] if result.data else {}
+
+
 # ======================================================================
 # Providers (PostGIS queries)
 # ======================================================================
@@ -200,6 +239,18 @@ async def book_slot(slot_id: int) -> dict:
     result = (
         sb.table("provider_availability")
         .update({"is_booked": True})
+        .eq("id", slot_id)
+        .execute()
+    )
+    return result.data[0] if result.data else {}
+
+
+async def unbook_slot(slot_id: int) -> dict:
+    """Release a previously-reserved slot (e.g. provider declined)."""
+    sb = get_supabase()
+    result = (
+        sb.table("provider_availability")
+        .update({"is_booked": False})
         .eq("id", slot_id)
         .execute()
     )
@@ -291,8 +342,23 @@ async def get_traces(request_id: str) -> list[dict]:
 
 
 async def get_next_seq(request_id: str) -> int:
-    """Get the next seq number for a request (gap-free)."""
+    """
+    Atomically allocate the next gap-free seq for a request via the
+    next_trace_seq() RPC (migration 0003). This is correct across multiple
+    backend replicas; the old SELECT max+1 raced and collided. Falls back
+    to max+1 only if the RPC is missing (migration not yet applied).
+    """
     sb = get_supabase()
+    try:
+        res = sb.rpc("next_trace_seq", {"p_request_id": request_id}).execute()
+        val = res.data
+        if isinstance(val, list):
+            val = val[0] if val else None
+        if val is not None:
+            return int(val)
+    except Exception as e:
+        logger.warning(f"next_trace_seq RPC unavailable, using fallback: {e}")
+
     result = (
         sb.table("agent_traces")
         .select("seq")

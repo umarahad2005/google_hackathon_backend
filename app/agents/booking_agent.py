@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -89,6 +90,7 @@ async def run_booking_agent(
     provider: RankedProvider,
     intent: ServiceIntent,
     user_id: str = "demo-user",
+    vendor_confirmation: dict | None = None,
 ) -> Booking:
     """
     Run the Booking Agent.
@@ -112,41 +114,116 @@ async def run_booking_agent(
     ) as trace:
         booking_id = str(uuid.uuid4())
 
-        # Determine slot times
+        # Requested window
         if intent.time_resolved:
-            slot_start = intent.time_resolved
-            slot_end = slot_start + timedelta(hours=1)
+            want_start = intent.time_resolved
+            window_end = intent.time_window_end or (want_start + timedelta(hours=3))
         else:
-            # Default: next morning 10 AM
             now = datetime.now(PKT)
-            tomorrow = now + timedelta(days=1)
-            slot_start = tomorrow.replace(hour=10, minute=0, second=0, microsecond=0)
-            slot_end = slot_start + timedelta(hours=1)
+            want_start = (now + timedelta(days=1)).replace(
+                hour=10, minute=0, second=0, microsecond=0
+            )
+            window_end = want_start + timedelta(hours=3)
 
-        # Estimate price based on category and price band
-        price_estimates = {
-            "ac_technician": "PKR 2,000 – 3,500",
-            "electrician": "PKR 1,000 – 2,500",
-            "plumber": "PKR 1,500 – 3,000",
-            "tutor": "PKR 2,000 – 5,000/month",
-            "beautician": "PKR 1,500 – 4,000",
-            "carpenter": "PKR 2,000 – 5,000",
-            "appliance_repair": "PKR 1,500 – 4,000",
-        }
-        price_estimate = price_estimates.get(
-            intent.service_type, "PKR 1,500 – 3,000"
+        # Price estimate: category base adjusted by the provider's real
+        # price_band (from the provider record), not a flat per-category lookup.
+        base_price = {
+            "ac_technician": (2000, 3500),
+            "electrician": (1000, 2500),
+            "plumber": (1500, 3000),
+            "tutor": (2000, 5000),
+            "beautician": (1500, 4000),
+            "carpenter": (2000, 5000),
+            "appliance_repair": (1500, 4000),
+        }.get(intent.service_type, (1500, 3000))
+        band_mult = {"low": 0.85, "mid": 1.0, "high": 1.25}.get(
+            provider.price_band.value if provider.price_band else "mid", 1.0
         )
+        lo = int(round(base_price[0] * band_mult / 100.0)) * 100
+        hi = int(round(base_price[1] * band_mult / 100.0)) * 100
+        suffix = "/month" if intent.service_type == "tutor" else ""
+        price_estimate = f"PKR {lo:,} – {hi:,}{suffix}"
 
-        # Step 1: Reserve slot (simulated + check availability)
-        trace.add_tool_call(
-            name="reserve_slot",
-            args={
-                "provider_id": provider.provider_id,
-                "slot_start": slot_start.isoformat(),
-                "slot_end": slot_end.isoformat(),
-            },
-            result_summary=f"Slot {slot_start.strftime('%H:%M')}–{slot_end.strftime('%H:%M')} reserved",
-        )
+        # Step 1: REAL slot reservation against provider_availability.
+        is_db_provider = _UUID_RE.match(provider.provider_id or "") is not None
+        chosen_slot_id: int | None = None
+        slot_start = want_start
+        slot_end = want_start + timedelta(hours=1)
+        booking_status = "confirmed"
+
+        if is_db_provider:
+            free = await get_availability(
+                provider.provider_id,
+                want_start - timedelta(minutes=30),
+                window_end + timedelta(minutes=30),
+            )
+            if free:
+                slot = free[0]  # earliest free slot in window
+                chosen_slot_id = slot["id"]
+                slot_start = datetime.fromisoformat(slot["slot_start"])
+                slot_end = datetime.fromisoformat(slot["slot_end"])
+                await book_slot(chosen_slot_id)  # transactional: is_booked=true
+                trace.add_tool_call(
+                    name="book_slot",
+                    args={
+                        "provider_id": provider.provider_id,
+                        "slot_id": chosen_slot_id,
+                        "slot_start": slot_start.isoformat(),
+                    },
+                    result_summary=(
+                        f"Reserved real slot #{chosen_slot_id} "
+                        f"{slot_start.strftime('%d %b %H:%M')}–"
+                        f"{slot_end.strftime('%H:%M')} (is_booked=true)"
+                    ),
+                )
+            else:
+                booking_status = "conflict"
+                trace.add_tool_call(
+                    name="book_slot",
+                    args={"provider_id": provider.provider_id},
+                    result_summary=(
+                        "No free slot in requested window — booking conflict"
+                    ),
+                )
+        else:
+            # Google Places provider — no availability table for it.
+            trace.add_tool_call(
+                name="book_slot",
+                args={"provider_id": provider.provider_id},
+                result_summary=(
+                    "Places provider has no DB availability; slot derived "
+                    "from requested time (no row reserved)"
+                ),
+                degraded=True,
+            )
+
+        if booking_status == "conflict":
+            trace.reasoning = (
+                f"{provider.name} has no free slot in the requested window "
+                f"({want_start.strftime('%d %b %H:%M')}–"
+                f"{window_end.strftime('%H:%M')}). Returning conflict so the "
+                f"orchestrator can pick an alternative."
+            )
+            trace.output_data = {"status": "conflict",
+                                 "provider_id": provider.provider_id}
+            return Booking(
+                booking_id=booking_id,
+                provider_id=provider.provider_id,
+                user_id=user_id,
+                slot_start=slot_start,
+                slot_end=slot_end,
+                status="conflict",
+                price_estimate=price_estimate,
+                confirmation_message="",
+                reasoning=(
+                    f"No availability for {provider.name} in the requested "
+                    f"window — booking not created."
+                ),
+            )
+
+        # The provider already accepted via the Vendor Calling Agent (run by
+        # the orchestrator before this agent). Record its handshake here.
+        vc = vendor_confirmation or {}
 
         # Step 2: Write booking to Supabase (THE CRITICAL STATE CHANGE)
         booking_data = {
@@ -158,11 +235,12 @@ async def run_booking_agent(
             "slot_end": slot_end.isoformat(),
             "status": "confirmed",
             "price_estimate": price_estimate,
-            "confirmation": {},
+            "slot_id": chosen_slot_id,
+            "confirmation": vc,
         }
 
         try:
-            db_result = await create_booking(booking_data)
+            await create_booking(booking_data)
             trace.add_tool_call(
                 name="write_booking",
                 args={"booking_id": booking_id},
@@ -175,6 +253,7 @@ async def run_booking_agent(
                 args={"booking_id": booking_id},
                 result_summary=f"FAILED: {e}",
             )
+            raise
 
         # Step 3: Generate receipt
         receipt = _generate_receipt(

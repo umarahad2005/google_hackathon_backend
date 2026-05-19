@@ -19,6 +19,9 @@ from datetime import datetime, timedelta, timezone
 from google import genai
 from google.genai import types
 
+import asyncio
+import re
+
 from app.agents.config import MODELS, RANKING_WEIGHTS
 from app.models import (
     ProviderCandidate,
@@ -28,7 +31,12 @@ from app.models import (
     DiscoveryResult,
 )
 from app.agents.trace_observer import TraceContext
+from app.services.supabase import get_availability
 from app.settings import get_settings
+
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,24 +50,63 @@ def _compute_distance_score(distance_km: float, max_distance: float) -> float:
     return max(0, 1.0 - (distance_km / max_distance))
 
 
+def _availability_window(
+    intent: ServiceIntent,
+) -> tuple[datetime, datetime]:
+    """The time window to check provider_availability against."""
+    if intent.time_resolved:
+        frm = intent.time_resolved - timedelta(minutes=30)
+        to = (intent.time_window_end or
+              intent.time_resolved + timedelta(hours=3)) + timedelta(minutes=30)
+        return frm, to
+    now = datetime.now(PKT)
+    return now, now + timedelta(days=7)
+
+
+async def _free_slot_counts(
+    candidates: list[ProviderCandidate],
+    intent: ServiceIntent,
+) -> dict[str, int]:
+    """
+    Query provider_availability for REAL free slots in the requested
+    window. Only DB-sourced providers (uuid ids) have availability rows.
+    """
+    frm, to = _availability_window(intent)
+
+    async def _count(c: ProviderCandidate) -> tuple[str, int]:
+        if c.source.value != "db" or not _UUID_RE.match(c.provider_id or ""):
+            return c.provider_id, -1  # unknown (Places); -1 = no DB data
+        try:
+            slots = await get_availability(c.provider_id, frm, to)
+            return c.provider_id, len(slots)
+        except Exception as e:
+            logger.warning(f"Availability lookup failed for {c.provider_id}: {e}")
+            return c.provider_id, -1
+
+    pairs = await asyncio.gather(*[_count(c) for c in candidates])
+    return dict(pairs)
+
+
 def _compute_availability_score(
     candidate: ProviderCandidate,
     intent: ServiceIntent,
+    free_count: int,
 ) -> float:
-    """Does the provider have availability in the requested time window?"""
-    # For demo: if open_now is available, use it for "now" urgency
+    """
+    Real availability: score from actual free provider_availability slots
+    in the requested window. free_count == -1 means no DB availability data
+    (e.g. a Google Places result) → fall back to open_now / neutral.
+    """
+    if free_count >= 0:
+        if free_count == 0:
+            return 0.15  # real signal: provider is fully booked then
+        # 1 free slot → 0.7, scaling to 1.0 at 4+ free slots
+        return round(min(1.0, 0.6 + 0.1 * free_count), 3)
+
+    # No DB availability (Places provider): use open_now if asked "now"
     if intent.urgency.value == "now" and candidate.open_now is not None:
         return 1.0 if candidate.open_now else 0.3
-
-    # Check working hours if available
-    if candidate.working_hours and intent.time_resolved:
-        # Simplified: assume provider is available during working hours
-        return 0.8
-
-    # Default: assume some availability for seeded providers
-    if candidate.source.value == "db":
-        return 0.7
-    return 0.5
+    return 0.55  # neutral — unknown availability, don't over-reward
 
 
 def _compute_rating_score(rating: float | None) -> float:
@@ -87,20 +134,25 @@ def _compute_price_fit_score(
 def score_candidates(
     candidates: list[ProviderCandidate],
     intent: ServiceIntent,
+    free_counts: dict[str, int] | None = None,
 ) -> list[RankedProvider]:
     """
     Deterministic scoring: score = 0.40·dist + 0.25·avail + 0.25·rating + 0.10·price.
-    Weights live in config (tunable).
+    Weights live in config (tunable). `free_counts` carries the REAL
+    provider_availability free-slot count per provider_id.
     """
     if not candidates:
         return []
 
+    free_counts = free_counts or {}
     max_distance = max(c.distance_km for c in candidates) if candidates else 1.0
 
     scored = []
     for i, c in enumerate(candidates):
         dist_score = _compute_distance_score(c.distance_km, max_distance)
-        avail_score = _compute_availability_score(c, intent)
+        avail_score = _compute_availability_score(
+            c, intent, free_counts.get(c.provider_id, -1)
+        )
         rating_score = _compute_rating_score(c.rating)
         price_score = _compute_price_fit_score(
             c.price_band.value if c.price_band else None,
@@ -233,8 +285,28 @@ async def run_ranking_agent(
         },
         model=MODELS.pro,
     ) as trace:
-        # 1. Score all candidates
-        ranked = score_candidates(discovery_result.candidates, intent)
+        # 1. Real availability lookup, then deterministic scoring
+        free_counts = await _free_slot_counts(
+            discovery_result.candidates, intent
+        )
+        frm, to = _availability_window(intent)
+        checked = sum(1 for v in free_counts.values() if v >= 0)
+        trace.add_tool_call(
+            name="query_provider_availability",
+            args={
+                "window_start": frm.isoformat(),
+                "window_end": to.isoformat(),
+                "providers_checked": checked,
+            },
+            result_summary=(
+                f"Queried provider_availability for {checked} DB providers; "
+                f"free-slot counts: "
+                f"{ {k[:8]: v for k, v in free_counts.items() if v >= 0} }"
+            ),
+        )
+        ranked = score_candidates(
+            discovery_result.candidates, intent, free_counts
+        )
 
         if not ranked:
             trace.reasoning = "No candidates to rank — discovery returned empty."

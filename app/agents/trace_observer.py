@@ -23,23 +23,12 @@ from app.services.supabase import insert_trace, get_next_seq
 
 logger = logging.getLogger(__name__)
 
-# In-memory seq counters for atomic allocation
-_seq_locks: dict[str, asyncio.Lock] = {}
-_seq_counters: dict[str, int] = {}
-
-
 async def _allocate_seq(request_id: str) -> int:
-    """Atomically allocate the next seq number for a request."""
-    if request_id not in _seq_locks:
-        _seq_locks[request_id] = asyncio.Lock()
-        _seq_counters[request_id] = 0
-
-    async with _seq_locks[request_id]:
-        if _seq_counters[request_id] == 0:
-            _seq_counters[request_id] = await get_next_seq(request_id)
-        else:
-            _seq_counters[request_id] += 1
-        return _seq_counters[request_id]
+    """
+    Allocate the next seq via the atomic DB RPC (see supabase.get_next_seq).
+    Authoritative across replicas — no fragile in-process counter.
+    """
+    return await get_next_seq(request_id)
 
 
 async def emit_trace(

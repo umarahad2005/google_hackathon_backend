@@ -30,8 +30,11 @@ class Settings(BaseSettings):
     backend_port: int = 8000
 
     # --- Model config ---
+    # NOTE: gemini-2.5-pro has a very low / billing-gated free-tier quota
+    # and is the usual cause of "quota exceeded". 2.5-flash has a generous
+    # free tier and is more than enough for short ranking/reasoning prose.
     gemini_flash_model: str = "gemini-2.0-flash"
-    gemini_pro_model: str = "gemini-2.5-pro"
+    gemini_pro_model: str = "gemini-2.5-flash"
 
     model_config = {
         "env_file": ".env",

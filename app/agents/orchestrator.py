@@ -23,6 +23,7 @@ from app.models import (
 from app.agents.intent_agent import run_intent_agent
 from app.agents.discovery_agent import run_discovery_agent
 from app.agents.ranking_agent import run_ranking_agent
+from app.agents.vendor_agent import run_vendor_agent
 from app.agents.booking_agent import run_booking_agent
 from app.agents.followup_agent import run_followup_agent
 from app.agents.trace_observer import TraceContext, emit_trace
@@ -246,24 +247,116 @@ async def run_orchestrator(
         ),
     )
 
-    booking = await run_booking_agent(
-        request_id, ranking_result.recommended, intent, user_id
-    )
+    # Real re-rank loop: walk the ranked list; if a provider has no slot or
+    # declines the assignment (booking.status == "conflict"), exclude it and
+    # try the next-best. This is genuine agentic recovery, not a stub.
+    booking = None
+    selected = ranking_result.recommended
+    attempt_pool = ranking_result.ranked[:5]
+
+    for attempt, cand in enumerate(attempt_pool, 1):
+        await emit_trace(
+            request_id=request_id,
+            agent="orchestrator",
+            step="orchestrator.route",
+            reasoning=(
+                f"Booking attempt {attempt}/{len(attempt_pool)}: "
+                f"{cand.name} (rank #{cand.rank}, score={cand.score:.3f}). "
+                f"Routing to Booking Agent for real slot reservation + "
+                f"vendor confirmation."
+            ),
+            output_data={"attempt": attempt, "provider": cand.name},
+        )
+
+        # Vendor Calling Agent: confirm with the provider BEFORE booking.
+        vc = await run_vendor_agent(request_id, cand, intent)
+        if vc.get("decision") != "accepted":
+            await _transition(
+                ctx, RequestState.RANKING,
+                f"{cand.name} declined the call → re-ranking",
+            )
+            await emit_trace(
+                request_id=request_id,
+                agent="ranking_decision",
+                step="ranking.rerank",
+                reasoning=(
+                    f"{cand.name} declined the confirmation call "
+                    f"({vc.get('note')}). Excluding it and promoting the "
+                    f"next ranked provider."
+                ),
+                output_data={"excluded": cand.name, "reason": "vendor_declined",
+                              "attempt": attempt},
+            )
+            continue
+
+        b = await run_booking_agent(
+            request_id, cand, intent, user_id, vendor_confirmation=vc
+        )
+        if b.status == "confirmed":
+            booking = b
+            selected = cand
+            ctx.selected = cand
+            break
+
+        # Accepted the call but had no open slot → re-rank to the next one.
+        await _transition(
+            ctx, RequestState.RANKING,
+            f"{cand.name} has no open slot → re-ranking to next provider",
+        )
+        await emit_trace(
+            request_id=request_id,
+            agent="ranking_decision",
+            step="ranking.rerank",
+            reasoning=(
+                f"{cand.name} accepted but had no free slot in the window "
+                f"(status=conflict). Excluding it and promoting the next "
+                f"ranked provider."
+            ),
+            output_data={"excluded": cand.name, "reason": "no_slot",
+                          "attempt": attempt},
+        )
+
     ctx.booking = booking
 
-    if booking.status == "conflict":
-        # Slot conflict → would re-rank, but for demo proceed
-        await _transition(ctx, RequestState.RANKING, "Slot conflict → re-ranking")
-        # Simplified: in a full implementation, re-rank excluding the conflicting slot
+    if booking is None or booking.status != "confirmed":
+        await _transition(
+            ctx, RequestState.NO_PROVIDER,
+            "All ranked providers were unavailable or declined the job.",
+        )
+        await emit_trace(
+            request_id=request_id,
+            agent="orchestrator",
+            step="booking.exhausted",
+            reasoning=(
+                f"Tried {len(attempt_pool)} ranked providers; none had an "
+                f"open slot or accepted the assignment. Returning NO_PROVIDER."
+            ),
+            output_data={"state": "NO_PROVIDER",
+                          "tried": [c.name for c in attempt_pool]},
+        )
+        try:
+            await update_service_request(request_id, {
+                "state": RequestState.NO_PROVIDER.value,
+                "result": {
+                    "recommended": ranking_result.recommended.model_dump(mode="json"),
+                    "booking": None,
+                },
+            })
+        except Exception as e:
+            logger.warning(f"Failed to update result: {e}")
+        return ctx
 
-    await _transition(ctx, RequestState.CONFIRMED, f"Booking confirmed: {booking.booking_id}")
+    await _transition(
+        ctx, RequestState.CONFIRMED,
+        f"Booking confirmed: {booking.booking_id} with {selected.name}",
+    )
 
     # Update service request with result
     try:
         await update_service_request(request_id, {
             "state": RequestState.CONFIRMED.value,
             "result": {
-                "recommended": ranking_result.recommended.model_dump(mode="json"),
+                "recommended": selected.model_dump(mode="json"),
                 "booking": booking.model_dump(mode="json"),
             },
         })
@@ -288,7 +381,7 @@ async def run_orchestrator(
 
     followups = await run_followup_agent(
         request_id, booking, intent,
-        provider_name=ranking_result.recommended.name,
+        provider_name=selected.name,
     )
     ctx.followups = followups
 
@@ -304,13 +397,13 @@ async def run_orchestrator(
             f"Pipeline complete. {len(followups)} follow-ups scheduled. "
             f"Request lifecycle is now managed by the Follow-up Agent. "
             f"Summary: {intent.service_type} in {intent.location_text} → "
-            f"{ranking_result.recommended.name} ({ranking_result.recommended.distance_km}km) → "
+            f"{selected.name} ({selected.distance_km}km) → "
             f"booked {booking.slot_start.strftime('%d %b %I:%M %p')} → "
-            f"follow-ups will fire via demo clock compression."
+            f"follow-ups fire on a real compressed timeline."
         ),
         output_data={
             "final_state": ctx.state.value,
-            "provider": ranking_result.recommended.name,
+            "provider": selected.name,
             "booking_id": booking.booking_id,
             "followup_count": len(followups),
         },

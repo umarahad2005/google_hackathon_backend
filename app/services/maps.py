@@ -113,40 +113,54 @@ def _get_maps_client() -> googlemaps.Client | None:
     return None
 
 
-def resolve_location(location_text: str) -> tuple[float, float] | None:
+def resolve_location(location_text: str) -> tuple[tuple[float, float], str] | None:
     """
-    Resolve a location text to (lat, lng).
-    Strategy: Geocoding API → sector gazetteer fallback.
+    Resolve a location text to ((lat, lng), source).
+
+    Real-Maps-first: Google Geocoding API is authoritative. The offline
+    sector gazetteer is only a fallback when the API key is absent or the
+    call fails. Returns None (honest failure) instead of silently
+    defaulting to city center, so the caller can flag it as degraded.
+
+    source ∈ {"geocoding", "gazetteer"}.
     """
-    normalized = location_text.strip().lower().replace(",", "").replace("islamabad", "").strip()
+    normalized = (
+        location_text.strip().lower().replace(",", "")
+        .replace("islamabad", "").strip()
+    )
 
-    # Check gazetteer first (fast + offline)
-    for key, coords in SECTOR_GAZETTEER.items():
-        if key in normalized or normalized in key:
-            logger.info(f"Location '{location_text}' resolved via gazetteer: {key} → {coords}")
-            return coords
-
-    # Try Geocoding API
+    # 1. Real Geocoding API (authoritative)
     client = _get_maps_client()
     if client:
         try:
             cache_key = f"geocode:{normalized}"
             if cache_key in _cache:
-                return _cache[cache_key]
-
+                return _cache[cache_key], "geocoding"
             results = client.geocode(f"{location_text}, Islamabad, Pakistan")
             if results:
                 loc = results[0]["geometry"]["location"]
                 coords = (loc["lat"], loc["lng"])
                 _cache[cache_key] = coords
-                logger.info(f"Location '{location_text}' resolved via Geocoding API: {coords}")
-                return coords
+                logger.info(
+                    f"Location '{location_text}' resolved via Geocoding API: {coords}"
+                )
+                return coords, "geocoding"
+            logger.warning(f"Geocoding API returned no result for '{location_text}'")
         except Exception as e:
             logger.warning(f"Geocoding API failed for '{location_text}': {e}")
 
-    # Fallback: default to Islamabad center
-    logger.warning(f"Location '{location_text}' unresolved, defaulting to Islamabad center")
-    return (33.6844, 73.0479)
+    # 2. Offline gazetteer fallback (degraded)
+    for key, coords in SECTOR_GAZETTEER.items():
+        if key in normalized or normalized in key:
+            logger.info(
+                f"Location '{location_text}' resolved via gazetteer fallback: "
+                f"{key} → {coords}"
+            )
+            return coords, "gazetteer"
+
+    # 3. Honest failure — no silent city-center default.
+    logger.error(f"Location '{location_text}' could not be resolved.")
+    return None
 
 
 def _places_nearby(
@@ -243,6 +257,97 @@ async def _db_providers_within(
         return []
 
 
+def _distance_matrix_refine(
+    origin: tuple[float, float],
+    candidates: list[ProviderCandidate],
+) -> tuple[bool, float | None]:
+    """
+    Replace straight-line distances with REAL driving distances from the
+    Google Distance Matrix API for the given candidates (mutated in place).
+
+    Returns (used_real_api, nearest_eta_min). Best-effort: on any failure
+    the haversine distances are left untouched.
+    """
+    client = _get_maps_client()
+    if not client or not candidates:
+        return False, None
+    try:
+        dests = [(c.lat, c.lng) for c in candidates]
+        cache_key = (
+            f"dm:{origin[0]:.4f}:{origin[1]:.4f}:"
+            f"{len(dests)}:{hash(tuple(dests))}"
+        )
+        if cache_key in _cache:
+            matrix = _cache[cache_key]
+        else:
+            matrix = client.distance_matrix(
+                origins=[origin],
+                destinations=dests,
+                mode="driving",
+            )
+            _cache[cache_key] = matrix
+
+        elements = matrix.get("rows", [{}])[0].get("elements", [])
+        nearest_eta_min: float | None = None
+        for cand, el in zip(candidates, elements):
+            if el.get("status") == "OK":
+                cand.distance_km = round(
+                    el["distance"]["value"] / 1000.0, 2
+                )
+                eta = el["duration"]["value"] / 60.0
+                if nearest_eta_min is None or eta < nearest_eta_min:
+                    nearest_eta_min = round(eta, 1)
+        return True, nearest_eta_min
+    except Exception as e:
+        logger.warning(f"Distance Matrix API failed: {e}")
+        return False, None
+
+
+def _enrich_place_details(candidates: list[ProviderCandidate]) -> int:
+    """
+    Pull REAL name / phone / rating from the Google Place Details API for
+    Places-sourced candidates (Nearby Search does not return phone numbers).
+    Mutates in place, capped + cached to control cost. Returns count enriched.
+    """
+    client = _get_maps_client()
+    if not client:
+        return 0
+    enriched = 0
+    for c in candidates:
+        if c.source != ProviderSource.PLACES or not c.provider_id:
+            continue
+        if c.phone:  # already have it
+            continue
+        cache_key = f"placedetails:{c.provider_id}"
+        try:
+            if cache_key in _cache:
+                det = _cache[cache_key]
+            else:
+                det = client.place(
+                    place_id=c.provider_id,
+                    fields=[
+                        "name",
+                        "formatted_phone_number",
+                        "international_phone_number",
+                        "rating",
+                        "user_ratings_total",
+                    ],
+                ).get("result", {})
+                _cache[cache_key] = det
+            if det.get("name"):
+                c.name = det["name"]
+            phone = (det.get("formatted_phone_number")
+                     or det.get("international_phone_number"))
+            if phone:
+                c.phone = phone
+            if det.get("rating") is not None:
+                c.rating = float(det["rating"])
+            enriched += 1
+        except Exception as e:
+            logger.warning(f"Place Details failed for {c.provider_id}: {e}")
+    return enriched
+
+
 def _deduplicate(
     candidates: list[ProviderCandidate],
 ) -> list[ProviderCandidate]:
@@ -286,54 +391,61 @@ async def find_candidates(
 
     Source: agents/skills/google-maps-integration.md
     """
-    coords = resolve_location(location_text)
-    if not coords:
+    resolved = resolve_location(location_text)
+    if resolved is None:
         return DiscoveryResult(
             candidates=[],
             radius_used_km=radius_km,
-            reasoning=f"Could not resolve location '{location_text}'",
+            reasoning=(
+                f"Could not resolve location '{location_text}' via Google "
+                f"Geocoding or the sector gazetteer. Discovery aborted."
+            ),
             degraded=True,
         )
 
-    lat, lng = coords
-    places_failed = False
+    (lat, lng), geo_source = resolved
 
-    # Fetch from both sources
+    # Real Google Places + seeded PostGIS DB, merged.
     places_candidates = _places_nearby(category, lat, lng, radius_km)
-    if not places_candidates:
-        places_failed = True
-
+    places_failed = not places_candidates
     db_candidates = await _db_providers_within(category, lat, lng, radius_km)
 
-    # Merge + deduplicate
-    all_candidates = places_candidates + db_candidates
-    merged = _deduplicate(all_candidates)
-
-    # Sort by distance
+    merged = _deduplicate(places_candidates + db_candidates)
     merged.sort(key=lambda c: c.distance_km)
-
-    # Keep top ~10
     merged = merged[:10]
 
-    # Build reasoning
+    # Real driving distances/ETA via Distance Matrix API.
+    dm_used, nearest_eta = _distance_matrix_refine((lat, lng), merged)
+    if dm_used:
+        merged.sort(key=lambda c: c.distance_km)
+
+    # Real name/phone/rating for the Google-Places providers.
+    enriched = _enrich_place_details(merged)
+
     places_count = sum(1 for c in merged if c.source == ProviderSource.PLACES)
     db_count = sum(1 for c in merged if c.source == ProviderSource.DB)
     reasoning = (
-        f"Searched for '{category}' within {radius_km}km of {location_text} "
-        f"(resolved to {lat:.4f}, {lng:.4f}). "
-        f"Found {len(merged)} candidates: {places_count} from Google Places, "
-        f"{db_count} from seeded database. "
+        f"Searched '{category}' within {radius_km}km of {location_text} "
+        f"(→ {lat:.4f},{lng:.4f} via {geo_source}). "
+        f"{len(merged)} candidates: {places_count} Google Places, "
+        f"{db_count} seeded DB. "
+        f"Distances: {'real driving (Distance Matrix)' if dm_used else 'straight-line haversine'}. "
+        f"{enriched} enriched with Place Details (real phone/rating). "
     )
     if places_failed:
-        reasoning += "Google Places API unavailable — using database only (degraded mode). "
+        reasoning += "Google Places returned nothing — DB-only (degraded). "
     if merged:
-        reasoning += f"Nearest: {merged[0].name} at {merged[0].distance_km}km."
+        reasoning += f"Nearest: {merged[0].name} at {merged[0].distance_km}km"
+        reasoning += f" (~{nearest_eta} min drive)." if nearest_eta else "."
     else:
         reasoning += "No providers found in this radius."
+
+    # Honest degraded signal: gazetteer fallback OR Places dead but DB saved it.
+    degraded = geo_source == "gazetteer" or (places_failed and db_count > 0)
 
     return DiscoveryResult(
         candidates=merged,
         radius_used_km=radius_km,
         reasoning=reasoning,
-        degraded=places_failed and db_count > 0,
+        degraded=degraded,
     )
